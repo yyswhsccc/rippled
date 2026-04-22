@@ -1,14 +1,23 @@
-#include <xrpl/basics/Log.h>
-#include <xrpl/ledger/View.h>
-#include <xrpl/protocol/st.h>
 #include <xrpl/tx/transactors/dex/OfferCancel.h>
+
+#include <xrpl/basics/Log.h>
+#include <xrpl/ledger/helpers/OfferHelpers.h>
+#include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STLedgerEntry.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/TER.h>
+#include <xrpl/protocol/XRPAmount.h>
+#include <xrpl/tx/Transactor.h>
+
+#include <memory>
 
 namespace xrpl {
 
 NotTEC
 OfferCancel::preflight(PreflightContext const& ctx)
 {
-    if (!ctx.tx[sfOfferSequence])
+    if (ctx.tx[sfOfferSequence] == 0u)
     {
         JLOG(ctx.j.trace()) << "OfferCancel::preflight: missing sequence";
         return temBAD_SEQUENCE;
@@ -53,7 +62,7 @@ OfferCancel::doApply()
     if (auto sleOffer = view().peek(keylet::offer(account_, offerSequence)))
     {
         JLOG(j_.debug()) << "Trying to cancel offer #" << offerSequence;
-        return offerDelete(view(), sleOffer, ctx_.registry.journal("View"));
+        return offerDelete(view(), sleOffer, ctx_.registry.get().getJournal("View"));
     }
 
     JLOG(j_.debug()) << "Offer #" << offerSequence << " can't be found.";

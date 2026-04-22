@@ -2,10 +2,14 @@
 //
 #include <xrpl/beast/utility/instrumentation.h>
 #include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/Issue.h>
 #include <xrpl/protocol/LedgerFormats.h>
 #include <xrpl/protocol/Protocol.h>
 #include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STAmount.h>
 #include <xrpl/protocol/STNumber.h>
+
+#include <algorithm>
 
 namespace xrpl {
 
@@ -41,6 +45,32 @@ VaultInvariantData::Shares::make(SLE const& from)
     return self;
 }
 
+[[nodiscard]] VaultInvariantData::DeltaInfo
+VaultInvariantData::DeltaInfo::makeDelta(
+    Number const& before,
+    Number const& after,
+    Asset const& asset)
+{
+    return {
+        .delta = after - before,
+        .scale = std::max(xrpl::scale(after, asset), xrpl::scale(before, asset))};
+}
+
+[[nodiscard]] std::int32_t
+VaultInvariantData::computeCoarsestScale(std::vector<DeltaInfo> const& numbers)
+{
+    if (numbers.empty())
+        return 0;
+
+    auto const max = std::ranges::max_element(
+        numbers, [](auto const& a, auto const& b) -> bool { return a.scale < b.scale; });
+    XRPL_ASSERT_PARTS(
+        max->scale,
+        "xrpl::VaultInvariantData::computeCoarsestScale",
+        "scale set for destinationDelta");
+    return max->scale.value_or(STAmount::cMaxOffset);
+}
+
 void
 VaultInvariantData::visitEntry(bool isDelete, SLE::const_ref before, SLE::const_ref after)
 {
@@ -52,10 +82,12 @@ VaultInvariantData::visitEntry(bool isDelete, SLE::const_ref before, SLE::const_
         "xrpl::VaultInvariantData::visitEntry : some object is available");
 
     // Number balanceDelta will capture the difference (delta) between "before"
-    // state (zero if created) and "after" state (zero if destroyed), so the
-    // invariants can validate that the change in account balances matches the
-    // change in vault balances, stored to deltas_ at the end of this function.
-    Number balanceDelta{};
+    // state (zero if created) and "after" state (zero if destroyed), and
+    // preserves value scale (exponent) to round values to the same scale during
+    // validation. It is used to validate that the change in account balances
+    // matches the change in vault balances, stored to deltas_ at the end of
+    // this function.
+    DeltaInfo balanceDelta{.delta = numZero, .scale = std::nullopt};
 
     std::int8_t sign = 0;
     if (before)
@@ -69,18 +101,34 @@ VaultInvariantData::visitEntry(bool isDelete, SLE::const_ref before, SLE::const_
                 // At this moment we have no way of telling if this object holds
                 // vault shares or something else. Save it for finalize.
                 beforeMPTs_.push_back(Shares::make(*before));
-                balanceDelta = static_cast<std::int64_t>(before->getFieldU64(sfOutstandingAmount));
+                balanceDelta.delta =
+                    static_cast<std::int64_t>(before->getFieldU64(sfOutstandingAmount));
+                // MPTs are ints, so the scale is always 0.
+                balanceDelta.scale = 0;
                 sign = 1;
                 break;
             case ltMPTOKEN:
-                balanceDelta = static_cast<std::int64_t>(before->getFieldU64(sfMPTAmount));
+                balanceDelta.delta = static_cast<std::int64_t>(before->getFieldU64(sfMPTAmount));
+                // MPTs are ints, so the scale is always 0.
+                balanceDelta.scale = 0;
                 sign = -1;
                 break;
             case ltACCOUNT_ROOT:
-            case ltRIPPLE_STATE:
-                balanceDelta = before->getFieldAmount(sfBalance);
+                balanceDelta.delta = before->getFieldAmount(sfBalance);
+                // Account balance is XRP, which is an int, so the scale is
+                // always 0.
+                balanceDelta.scale = 0;
                 sign = -1;
                 break;
+            case ltRIPPLE_STATE: {
+                auto const amount = before->getFieldAmount(sfBalance);
+                balanceDelta.delta = amount;
+                // Trust Line balances are STAmounts, so we can use the exponent
+                // directly to get the scale.
+                balanceDelta.scale = amount.exponent();
+                sign = -1;
+                break;
+            }
             default:;
         }
     }
@@ -96,19 +144,36 @@ VaultInvariantData::visitEntry(bool isDelete, SLE::const_ref before, SLE::const_
                 // At this moment we have no way of telling if this object holds
                 // vault shares or something else. Save it for finalize.
                 afterMPTs_.push_back(Shares::make(*after));
-                balanceDelta -=
+                balanceDelta.delta -=
                     Number(static_cast<std::int64_t>(after->getFieldU64(sfOutstandingAmount)));
+                // MPTs are ints, so the scale is always 0.
+                balanceDelta.scale = 0;
                 sign = 1;
                 break;
             case ltMPTOKEN:
-                balanceDelta -= Number(static_cast<std::int64_t>(after->getFieldU64(sfMPTAmount)));
+                balanceDelta.delta -=
+                    Number(static_cast<std::int64_t>(after->getFieldU64(sfMPTAmount)));
+                // MPTs are ints, so the scale is always 0.
+                balanceDelta.scale = 0;
                 sign = -1;
                 break;
             case ltACCOUNT_ROOT:
-            case ltRIPPLE_STATE:
-                balanceDelta -= Number(after->getFieldAmount(sfBalance));
+                balanceDelta.delta -= Number(after->getFieldAmount(sfBalance));
+                // Account balance is XRP, which is an int, so the scale is
+                // always 0.
+                balanceDelta.scale = 0;
                 sign = -1;
                 break;
+            case ltRIPPLE_STATE: {
+                auto const amount = after->getFieldAmount(sfBalance);
+                balanceDelta.delta -= Number(amount);
+                // Trust Line balances are STAmounts, so we can use the exponent
+                // directly to get the scale.
+                if (amount.exponent() > balanceDelta.scale)
+                    balanceDelta.scale = amount.exponent();
+                sign = -1;
+                break;
+            }
             default:;
         }
     }
@@ -120,18 +185,23 @@ VaultInvariantData::visitEntry(bool isDelete, SLE::const_ref before, SLE::const_
     // transferred to the account. We intentionally do not compare balanceDelta
     // against zero, to avoid missing such updates.
     if (sign != 0)
-        deltas_[key] = balanceDelta * sign;
+    {
+        XRPL_ASSERT_PARTS(
+            balanceDelta.scale, "xrpl::VaultInvariantData::visitEntry", "scale initialized");
+        balanceDelta.delta *= sign;
+        deltas_[key] = balanceDelta;
+    }
 }
 
-std::optional<Number>
+std::optional<VaultInvariantData::DeltaInfo>
 VaultInvariantData::deltaAssets(Asset const& vaultAsset, AccountID const& id) const
 {
     auto const get =  //
-        [&](auto const& it, std::int8_t sign = 1) -> std::optional<Number> {
+        [&](auto const& it, std::int8_t sign = 1) -> std::optional<DeltaInfo> {
         if (it == deltas_.end())
             return std::nullopt;
 
-        return it->second * sign;
+        return DeltaInfo{it->second.delta * sign, it->second.scale};
     };
 
     return std::visit(
@@ -151,7 +221,7 @@ VaultInvariantData::deltaAssets(Asset const& vaultAsset, AccountID const& id) co
         vaultAsset.value());
 }
 
-std::optional<Number>
+std::optional<VaultInvariantData::DeltaInfo>
 VaultInvariantData::deltaAssetsTxAccount(
     AccountID const& account,
     std::optional<AccountID> const& delegate,
@@ -167,14 +237,14 @@ VaultInvariantData::deltaAssetsTxAccount(
     if (delegate.has_value() && *delegate != account)
         return ret;
 
-    *ret += fee.drops();
-    if (*ret == beast::zero)
+    ret->delta += fee.drops();
+    if (ret->delta == beast::zero)
         return std::nullopt;
 
     return ret;
 }
 
-std::optional<Number>
+std::optional<VaultInvariantData::DeltaInfo>
 VaultInvariantData::deltaShares(
     AccountID const& pseudoId,
     uint192 const& shareMPTID,
@@ -186,7 +256,7 @@ VaultInvariantData::deltaShares(
         return deltas_.find(keylet::mptoken(shareMPTID, id).key);
     }();
 
-    return it != deltas_.end() ? std::optional<Number>(it->second) : std::nullopt;
+    return it != deltas_.end() ? std::optional<DeltaInfo>(it->second) : std::nullopt;
 }
 
 std::optional<VaultInvariantData::Shares>

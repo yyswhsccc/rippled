@@ -1,13 +1,29 @@
-#include <xrpl/basics/Log.h>
-#include <xrpl/ledger/ApplyView.h>
-#include <xrpl/ledger/CredentialHelpers.h>
-#include <xrpl/ledger/View.h>
-#include <xrpl/protocol/Feature.h>
-#include <xrpl/protocol/Indexes.h>
-#include <xrpl/protocol/TxFlags.h>
 #include <xrpl/tx/transactors/credentials/CredentialCreate.h>
 
+#include <xrpl/basics/Log.h>
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/core/ServiceRegistry.h>
+#include <xrpl/ledger/ApplyView.h>
+#include <xrpl/ledger/helpers/AccountRootHelpers.h>
+#include <xrpl/ledger/helpers/CredentialHelpers.h>  // IWYU pragma: keep
+#include <xrpl/ledger/helpers/DirectoryHelpers.h>
+#include <xrpl/protocol/Feature.h>
+#include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/Keylet.h>
+#include <xrpl/protocol/LedgerFormats.h>
+#include <xrpl/protocol/Protocol.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STAmount.h>
+#include <xrpl/protocol/STLedgerEntry.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/TER.h>
+#include <xrpl/protocol/TxFlags.h>
+#include <xrpl/protocol/XRPAmount.h>
+#include <xrpl/tx/Transactor.h>
+
 #include <chrono>
+#include <cstdint>
+#include <memory>
 
 namespace xrpl {
 
@@ -146,14 +162,15 @@ CredentialCreate::doApply()
     }
     else
     {
+        // Added to both dirs, owned only by issuer. CredentialAccept will transfer ownership to
+        // subject. CredentialDelete will remove from both dirs and decrement 1 ownerCount.
         auto const page =
             view().dirInsert(keylet::ownerDir(subject), credentialKey, describeOwnerDir(subject));
-        JLOG(j_.trace()) << "Adding Credential to owner directory " << to_string(credentialKey.key)
-                         << ": " << (page ? "success" : "failure");
+        JLOG(j_.trace()) << "Adding Credential to subject directory "
+                         << to_string(credentialKey.key) << ": " << (page ? "success" : "failure");
         if (!page)
             return tecDIR_FULL;
         sleCred->setFieldU64(sfSubjectNode, *page);
-        view().update(view().peek(keylet::account(subject)));
     }
 
     view().insert(sleCred);

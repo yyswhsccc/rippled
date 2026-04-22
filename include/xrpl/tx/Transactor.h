@@ -7,13 +7,15 @@
 #include <xrpl/tx/ApplyContext.h>
 #include <xrpl/tx/applySteps.h>
 
+#include <utility>
+
 namespace xrpl {
 
 /** State information when preflighting a tx. */
 struct PreflightContext
 {
 public:
-    ServiceRegistry& registry;
+    std::reference_wrapper<ServiceRegistry> registry;
     STTx const& tx;
     Rules const rules;
     ApplyFlags flags;
@@ -24,12 +26,12 @@ public:
         ServiceRegistry& registry_,
         STTx const& tx_,
         uint256 parentBatchId_,
-        Rules const& rules_,
+        Rules rules_,
         ApplyFlags flags_,
         beast::Journal j_ = beast::Journal{beast::Journal::getNullSink()})
         : registry(registry_)
         , tx(tx_)
-        , rules(rules_)
+        , rules(std::move(rules_))
         , flags(flags_)
         , parentBatchId(parentBatchId_)
         , j(j_)
@@ -40,10 +42,10 @@ public:
     PreflightContext(
         ServiceRegistry& registry_,
         STTx const& tx_,
-        Rules const& rules_,
+        Rules rules_,
         ApplyFlags flags_,
         beast::Journal j_ = beast::Journal{beast::Journal::getNullSink()})
-        : registry(registry_), tx(tx_), rules(rules_), flags(flags_), j(j_)
+        : registry(registry_), tx(tx_), rules(std::move(rules_)), flags(flags_), j(j_)
     {
         XRPL_ASSERT((flags_ & tapBATCH) == 0, "Batch apply flag should not be set");
     }
@@ -56,7 +58,7 @@ public:
 struct PreclaimContext
 {
 public:
-    ServiceRegistry& registry;
+    std::reference_wrapper<ServiceRegistry> registry;
     ReadView const& view;
     TER preflightResult;
     ApplyFlags flags;
@@ -116,13 +118,11 @@ protected:
     AccountID const account_;
     XRPAmount preFeeBalance_{};  // Balance before fees.
 
+public:
+    virtual ~Transactor() = default;
     Transactor(Transactor const&) = delete;
     Transactor&
     operator=(Transactor const&) = delete;
-
-public:
-    virtual ~Transactor() = default;
-
     enum ConsequencesFactoryType { Normal, Blocker, Custom };
 
     /** Process the transaction. */
@@ -255,8 +255,11 @@ protected:
      *  @param isDelete  true if the entry was erased from the ledger.
      *  @param before    the entry's state before the transaction (nullptr
      *                   for newly created entries).
-     *  @param after     the entry's state after the transaction (nullptr
-     *                   when isDelete is true).
+     *  @param after     the entry's state as supplied by the apply logic
+     *                   for this transaction. For deletions, this is the
+     *                   SLE being erased and is not guaranteed to be null;
+     *                   callers must use isDelete rather than after == nullptr
+     *                   to detect deletions.
      */
     virtual void
     visitInvariantEntry(

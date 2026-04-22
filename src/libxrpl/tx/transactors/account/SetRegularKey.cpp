@@ -1,7 +1,19 @@
-#include <xrpl/basics/Log.h>
-#include <xrpl/protocol/Feature.h>
-#include <xrpl/protocol/TxFlags.h>
 #include <xrpl/tx/transactors/account/SetRegularKey.h>
+
+#include <xrpl/basics/Slice.h>
+#include <xrpl/beast/utility/Journal.h>
+#include <xrpl/ledger/ReadView.h>
+#include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/LedgerFormats.h>
+#include <xrpl/protocol/PublicKey.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STLedgerEntry.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/TER.h>
+#include <xrpl/protocol/XRPAmount.h>
+#include <xrpl/tx/Transactor.h>
+
+#include <memory>
 
 namespace xrpl {
 
@@ -17,7 +29,7 @@ SetRegularKey::calculateBaseFee(ReadView const& view, STTx const& tx)
         {
             auto const sle = view.read(keylet::account(id));
 
-            if (sle && (!(sle->getFlags() & lsfPasswordSpent)))
+            if (sle && ((sle->getFlags() & lsfPasswordSpent) == 0u))
             {
                 // flag is armed and they signed with the right account
                 return XRPAmount{0};

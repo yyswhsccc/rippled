@@ -20,6 +20,8 @@ class ValidVault
     VaultInvariantData data_;
 
 public:
+    using DeltaInfo = VaultInvariantData::DeltaInfo;
+
     void
     visitEntry(
         bool isDelete,
@@ -28,6 +30,12 @@ public:
 
     bool
     finalize(STTx const&, TER const, XRPAmount const, ReadView const&, beast::Journal const&);
+
+    [[nodiscard]] static std::int32_t
+    computeCoarsestScale(std::vector<DeltaInfo> const& numbers)
+    {
+        return VaultInvariantData::computeCoarsestScale(numbers);
+    }
 };
 
 }  // namespace xrpl

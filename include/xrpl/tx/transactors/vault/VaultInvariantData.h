@@ -39,20 +39,30 @@ public:
         Shares static make(SLE const&);
     };
 
+    struct DeltaInfo final
+    {
+        Number delta = numZero;
+        std::optional<int> scale;
+
+        // Compute the delta between two Numbers, taking the coarsest scale
+        [[nodiscard]] static DeltaInfo
+        makeDelta(Number const& before, Number const& after, Asset const& asset);
+    };
+
     void
     visitEntry(bool isDelete, SLE::const_ref before, SLE::const_ref after);
 
-    [[nodiscard]] std::optional<Number>
+    [[nodiscard]] std::optional<DeltaInfo>
     deltaAssets(Asset const& vaultAsset, AccountID const& id) const;
 
-    [[nodiscard]] std::optional<Number>
+    [[nodiscard]] std::optional<DeltaInfo>
     deltaAssetsTxAccount(
         AccountID const& account,
         std::optional<AccountID> const& delegate,
         Asset const& vaultAsset,
         XRPAmount fee) const;
 
-    [[nodiscard]] std::optional<Number>
+    [[nodiscard]] std::optional<DeltaInfo>
     deltaShares(AccountID const& pseudoId, uint192 const& shareMPTID, AccountID const& id) const;
 
     [[nodiscard]] std::optional<Shares>
@@ -63,6 +73,10 @@ public:
 
     [[nodiscard]] static bool
     vaultHoldsNoAssets(Vault const& vault);
+
+    // Compute the coarsest scale required to represent all numbers
+    [[nodiscard]] static std::int32_t
+    computeCoarsestScale(std::vector<DeltaInfo> const& numbers);
 
     [[nodiscard]] std::vector<Vault> const&
     afterVault() const
@@ -81,7 +95,7 @@ private:
     std::vector<Shares> afterMPTs_;
     std::vector<Vault> beforeVault_;
     std::vector<Shares> beforeMPTs_;
-    std::unordered_map<uint256, Number> deltas_;
+    std::unordered_map<uint256, DeltaInfo> deltas_;
 };
 
 }  // namespace xrpl

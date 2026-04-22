@@ -1,7 +1,20 @@
-#include <xrpl/protocol/Feature.h>
-#include <xrpl/protocol/TxFlags.h>
 #include <xrpl/tx/transactors/nft/NFTokenModify.h>
-#include <xrpl/tx/transactors/nft/NFTokenUtils.h>
+
+#include <xrpl/basics/base_uint.h>
+#include <xrpl/beast/utility/Journal.h>
+#include <xrpl/ledger/helpers/NFTokenHelpers.h>
+#include <xrpl/protocol/AccountID.h>
+#include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/Protocol.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STLedgerEntry.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/TER.h>
+#include <xrpl/protocol/XRPAmount.h>
+#include <xrpl/protocol/nft.h>
+#include <xrpl/tx/Transactor.h>
+
+#include <memory>
 
 namespace xrpl {
 
@@ -30,7 +43,7 @@ NFTokenModify::preclaim(PreclaimContext const& ctx)
         return tecNO_ENTRY;
 
     // Check if the NFT is mutable
-    if (!(nft::getFlags(ctx.tx[sfNFTokenID]) & nft::flagMutable))
+    if ((nft::getFlags(ctx.tx[sfNFTokenID]) & nft::flagMutable) == 0)
         return tecNO_PERMISSION;
 
     // Verify permissions for the issuer
