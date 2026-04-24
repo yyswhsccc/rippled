@@ -12,6 +12,7 @@
 #include <xrpl/protocol/LedgerFormats.h>
 #include <xrpl/protocol/MPTIssue.h>
 #include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STAmount.h>
 #include <xrpl/protocol/STLedgerEntry.h>
 #include <xrpl/protocol/STNumber.h>  // IWYU pragma: keep
 #include <xrpl/protocol/STTakesAsset.h>
@@ -20,6 +21,7 @@
 #include <xrpl/protocol/XRPAmount.h>
 #include <xrpl/tx/Transactor.h>
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 
@@ -310,23 +312,35 @@ VaultDeposit::finalizeInvariants(
     auto result = true;
     auto const& beforeVault = invariantData_.beforeVault()[0];
     auto const& afterVault = invariantData_.afterVault()[0];
+    auto const& vaultAsset = afterVault.asset;
 
-    auto const vaultDeltaAssets = invariantData_.deltaAssets(afterVault.asset, afterVault.pseudoId);
+    auto const maybeVaultDeltaAssets = invariantData_.deltaAssets(vaultAsset, afterVault.pseudoId);
 
-    if (!vaultDeltaAssets)
+    if (!maybeVaultDeltaAssets)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit must change vault balance";
         return false;
     }
 
-    if (*vaultDeltaAssets > tx[sfAmount])
+    // Get the coarsest scale to round calculations to.
+    auto const totalDelta = VaultInvariantData::DeltaInfo::makeDelta(
+        beforeVault.assetsTotal, afterVault.assetsTotal, vaultAsset);
+    auto const availableDelta = VaultInvariantData::DeltaInfo::makeDelta(
+        beforeVault.assetsAvailable, afterVault.assetsAvailable, vaultAsset);
+    auto const minScale = VaultInvariantData::computeCoarsestScale(
+        {*maybeVaultDeltaAssets, totalDelta, availableDelta});
+
+    auto const vaultDeltaAssets = roundToAsset(vaultAsset, maybeVaultDeltaAssets->delta, minScale);
+    auto const txAmount = roundToAsset(vaultAsset, tx[sfAmount], minScale);
+
+    if (vaultDeltaAssets > txAmount)
     {
         JLOG(j.fatal()) <<  //
             "Invariant failed: deposit must not change vault balance by more than deposited amount";
         result = false;
     }
 
-    if (*vaultDeltaAssets <= beast::zero)
+    if (vaultDeltaAssets <= beast::zero)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit must increase vault balance";
         result = false;
@@ -335,28 +349,35 @@ VaultDeposit::finalizeInvariants(
     // Any payments (including deposits) made by the issuer
     // do not change their balance, but create funds instead.
     bool const issuerDeposit = [&]() -> bool {
-        if (afterVault.asset.native())
+        if (vaultAsset.native())
             return false;
-        return tx[sfAccount] == afterVault.asset.getIssuer();
+        return tx[sfAccount] == vaultAsset.getIssuer();
     }();
 
     if (!issuerDeposit)
     {
-        auto const accountDeltaAssets = invariantData_.deltaAssetsTxAccount(
-            tx[sfAccount], tx[~sfDelegate], afterVault.asset, fee);
-        if (!accountDeltaAssets)
+        auto const maybeAccDeltaAssets =
+            invariantData_.deltaAssetsTxAccount(tx[sfAccount], tx[~sfDelegate], vaultAsset, fee);
+        if (!maybeAccDeltaAssets)
         {
             JLOG(j.fatal()) << "Invariant failed: deposit must change depositor balance";
             return false;
         }
+        auto const localMinScale =
+            std::max(minScale, VaultInvariantData::computeCoarsestScale({*maybeAccDeltaAssets}));
 
-        if (*accountDeltaAssets >= beast::zero)
+        auto const accountDeltaAssets =
+            roundToAsset(vaultAsset, maybeAccDeltaAssets->delta, localMinScale);
+        auto const localVaultDeltaAssets =
+            roundToAsset(vaultAsset, vaultDeltaAssets, localMinScale);
+
+        if (accountDeltaAssets >= beast::zero)
         {
             JLOG(j.fatal()) << "Invariant failed: deposit must decrease depositor balance";
             result = false;
         }
 
-        if (*accountDeltaAssets * -1 != *vaultDeltaAssets)
+        if (localVaultDeltaAssets * -1 != accountDeltaAssets)
         {
             JLOG(j.fatal()) <<  //
                 "Invariant failed: deposit must change vault and depositor balance by equal amount";
@@ -371,41 +392,49 @@ VaultDeposit::finalizeInvariants(
         result = false;
     }
 
-    auto const accountDeltaShares =
+    // We don't need to round shares, they are integral MPT.
+    auto const maybeAccDeltaShares =
         invariantData_.deltaShares(afterVault.pseudoId, afterVault.shareMPTID, tx[sfAccount]);
-    if (!accountDeltaShares)
+    if (!maybeAccDeltaShares)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit must change depositor shares";
         return false;
     }
+    auto const& accountDeltaShares = *maybeAccDeltaShares;
 
-    if (*accountDeltaShares <= beast::zero)
+    if (accountDeltaShares.delta <= beast::zero)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit must increase depositor shares";
         result = false;
     }
 
-    auto const vaultDeltaShares =
+    auto const maybeVaultDeltaShares =
         invariantData_.deltaShares(afterVault.pseudoId, afterVault.shareMPTID, afterVault.pseudoId);
-    if (!vaultDeltaShares || *vaultDeltaShares == beast::zero)
+    if (!maybeVaultDeltaShares || maybeVaultDeltaShares->delta == beast::zero)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit must change vault shares";
         return false;
     }
+    auto const& vaultDeltaShares = *maybeVaultDeltaShares;
 
-    if (*vaultDeltaShares * -1 != *accountDeltaShares)
+    if (vaultDeltaShares.delta * -1 != accountDeltaShares.delta)
     {
         JLOG(j.fatal()) <<  //
             "Invariant failed: deposit must change depositor and vault shares by equal amount";
         result = false;
     }
 
-    if (beforeVault.assetsTotal + *vaultDeltaAssets != afterVault.assetsTotal)
+    auto const assetTotalDelta =
+        roundToAsset(vaultAsset, afterVault.assetsTotal - beforeVault.assetsTotal, minScale);
+    if (assetTotalDelta != vaultDeltaAssets)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit and assets outstanding must add up";
         result = false;
     }
-    if (beforeVault.assetsAvailable + *vaultDeltaAssets != afterVault.assetsAvailable)
+
+    auto const assetAvailableDelta = roundToAsset(
+        vaultAsset, afterVault.assetsAvailable - beforeVault.assetsAvailable, minScale);
+    if (assetAvailableDelta != vaultDeltaAssets)
     {
         JLOG(j.fatal()) << "Invariant failed: deposit and assets available must add up";
         result = false;

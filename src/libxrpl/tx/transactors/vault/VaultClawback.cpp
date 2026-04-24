@@ -500,9 +500,10 @@ VaultClawback::finalizeInvariants(
 
     auto const& beforeVault = invariantData_.beforeVault()[0];
     auto const& afterVault = invariantData_.afterVault()[0];
+    auto const& vaultAsset = afterVault.asset;
     auto const beforeShares = invariantData_.resolveBeforeShares(beforeVault);
 
-    if (afterVault.asset.native() || afterVault.asset.getIssuer() != tx[sfAccount])
+    if (vaultAsset.native() || vaultAsset.getIssuer() != tx[sfAccount])
     {
         // The owner can use clawback to force-burn shares when the
         // vault is empty but there are outstanding shares
@@ -518,22 +519,35 @@ VaultClawback::finalizeInvariants(
 
     auto result = true;
 
-    auto const vaultDeltaAssets = invariantData_.deltaAssets(afterVault.asset, afterVault.pseudoId);
-    if (vaultDeltaAssets)
+    auto const maybeVaultDeltaAssets = invariantData_.deltaAssets(vaultAsset, afterVault.pseudoId);
+    if (maybeVaultDeltaAssets)
     {
-        if (*vaultDeltaAssets >= beast::zero)
+        auto const totalDelta = VaultInvariantData::DeltaInfo::makeDelta(
+            beforeVault.assetsTotal, afterVault.assetsTotal, vaultAsset);
+        auto const availableDelta = VaultInvariantData::DeltaInfo::makeDelta(
+            beforeVault.assetsAvailable, afterVault.assetsAvailable, vaultAsset);
+        auto const minScale = VaultInvariantData::computeCoarsestScale(
+            {*maybeVaultDeltaAssets, totalDelta, availableDelta});
+        auto const vaultDeltaAssets =
+            roundToAsset(vaultAsset, maybeVaultDeltaAssets->delta, minScale);
+
+        if (vaultDeltaAssets >= beast::zero)
         {
             JLOG(j.fatal()) << "Invariant failed: clawback must decrease vault balance";
             result = false;
         }
 
-        if (beforeVault.assetsTotal + *vaultDeltaAssets != afterVault.assetsTotal)
+        auto const assetsTotalDelta =
+            roundToAsset(vaultAsset, afterVault.assetsTotal - beforeVault.assetsTotal, minScale);
+        if (assetsTotalDelta != vaultDeltaAssets)
         {
             JLOG(j.fatal()) << "Invariant failed: clawback and assets outstanding must add up";
             result = false;
         }
 
-        if (beforeVault.assetsAvailable + *vaultDeltaAssets != afterVault.assetsAvailable)
+        auto const assetAvailableDelta = roundToAsset(
+            vaultAsset, afterVault.assetsAvailable - beforeVault.assetsAvailable, minScale);
+        if (assetAvailableDelta != vaultDeltaAssets)
         {
             JLOG(j.fatal()) << "Invariant failed: clawback and assets available must add up";
             result = false;
@@ -545,15 +559,16 @@ VaultClawback::finalizeInvariants(
         return false;
     }
 
-    auto const accountDeltaShares =
+    // We don't need to round shares, they are integral MPT.
+    auto const maybeAccountDeltaShares =
         invariantData_.deltaShares(afterVault.pseudoId, afterVault.shareMPTID, tx[sfHolder]);
-    if (!accountDeltaShares)
+    if (!maybeAccountDeltaShares)
     {
         JLOG(j.fatal()) << "Invariant failed: clawback must change holder shares";
         return false;
     }
 
-    if (*accountDeltaShares >= beast::zero)
+    if (maybeAccountDeltaShares->delta >= beast::zero)
     {
         JLOG(j.fatal()) << "Invariant failed: clawback must decrease holder shares";
         result = false;
@@ -561,13 +576,13 @@ VaultClawback::finalizeInvariants(
 
     auto const vaultDeltaShares =
         invariantData_.deltaShares(afterVault.pseudoId, afterVault.shareMPTID, afterVault.pseudoId);
-    if (!vaultDeltaShares || *vaultDeltaShares == beast::zero)
+    if (!vaultDeltaShares || vaultDeltaShares->delta == beast::zero)
     {
         JLOG(j.fatal()) << "Invariant failed: clawback must change vault shares";
         return false;
     }
 
-    if (*vaultDeltaShares * -1 != *accountDeltaShares)
+    if (vaultDeltaShares->delta * -1 != maybeAccountDeltaShares->delta)
     {
         JLOG(j.fatal()) <<  //
             "Invariant failed: clawback must change holder and vault shares by equal amount";
