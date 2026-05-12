@@ -246,8 +246,7 @@ applyCreate(ApplyContext& ctx, Sandbox& sb, AccountID const& account, beast::Jou
     // Mitigate same account exists possibility
     std::uint32_t const additionalFlags =
         sb.rules().enabled(fixTokenEscrowV1_1) ? lsfAllowTrustLineLocking : 0u;
-    auto const maybeAccount =
-        createPseudoAccount(sb, ammKeylet.key, sfAMMID, additionalFlags);
+    auto const maybeAccount = createPseudoAccount(sb, ammKeylet.key, sfAMMID, additionalFlags);
     // AMM account already exists (should not happen)
     if (!maybeAccount)
     {

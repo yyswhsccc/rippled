@@ -412,11 +412,8 @@ struct EscrowToken_test : public beast::unit_test::Suite
 
             if (withFix)
             {
-                auto const sleAMM =
-                    env.le(keylet::account(ammAccount));
-                BEAST_EXPECT(
-                    sleAMM &&
-                    sleAMM->isFlag(lsfAllowTrustLineLocking));
+                auto const sleAMM = env.le(keylet::account(ammAccount));
+                BEAST_EXPECT(sleAMM && sleAMM->isFlag(lsfAllowTrustLineLocking));
             }
         }
 
@@ -454,9 +451,7 @@ struct EscrowToken_test : public beast::unit_test::Suite
             if (withFix)
             {
                 auto const sleGW = env.le(keylet::account(gw));
-                BEAST_EXPECT(
-                    sleGW &&
-                    sleGW->isFlag(lsfAllowTrustLineLocking));
+                BEAST_EXPECT(sleGW && sleGW->isFlag(lsfAllowTrustLineLocking));
             }
         }
 

@@ -273,8 +273,7 @@ createPseudoAccount(
     // rippling, and enable deposit authorization to prevent payments into
     // pseudo-account.
     account->setFieldU32(
-        sfFlags,
-        lsfDisableMaster | lsfDefaultRipple | lsfDepositAuth | additionalFlags);
+        sfFlags, lsfDisableMaster | lsfDefaultRipple | lsfDepositAuth | additionalFlags);
     // Link the pseudo-account with its owner object.
     account->setFieldH256(ownerField, pseudoOwnerKey);
 

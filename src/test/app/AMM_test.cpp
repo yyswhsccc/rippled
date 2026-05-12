@@ -4382,10 +4382,8 @@ private:
             BEAST_EXPECT(sleAMM->isFlag(lsfDisableMaster));
             BEAST_EXPECT(sleAMM->isFlag(lsfDefaultRipple));
             BEAST_EXPECT(sleAMM->isFlag(lsfDepositAuth));
-            bool const flag =
-                sleAMM->isFlag(lsfAllowTrustLineLocking);
-            BEAST_EXPECT(
-                features[fixTokenEscrowV1_1] ? flag : !flag);
+            bool const flag = sleAMM->isFlag(lsfAllowTrustLineLocking);
+            BEAST_EXPECT(features[fixTokenEscrowV1_1] ? flag : !flag);
         }
     }
 
