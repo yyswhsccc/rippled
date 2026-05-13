@@ -95,9 +95,18 @@ VaultWithdraw::preclaim(PreclaimContext const& ctx)
             // LCOV_EXCL_STOP
         }
 
+        // Post-fixCleanup3_2_0: a sole shareholder redeems at the
+        // full-price exchange rate. Mirror that here so
+        // the limit check is computed against the amount actually
+        // payable in doApply.
+        WaiveUnrealizedLoss const waive = (ctx.view.rules().enabled(fixCleanup3_2_0) &&
+                                           isSoleShareholder(ctx.view, account, sleIssuance))
+            ? WaiveUnrealizedLoss::Yes
+            : WaiveUnrealizedLoss::No;
+
         try
         {
-            auto const maybeAssets = sharesToAssetsWithdraw(vault, sleIssuance, amount);
+            auto const maybeAssets = sharesToAssetsWithdraw(vault, sleIssuance, amount, waive);
             if (!maybeAssets)
                 return tefINTERNAL;  // LCOV_EXCL_LINE
 
@@ -175,6 +184,19 @@ VaultWithdraw::doApply()
     MPTIssue const share{mptIssuanceID};
     STAmount sharesRedeemed = {share};
     STAmount assetsWithdrawn;
+
+    bool const useFix = view().rules().enabled(fixCleanup3_2_0);
+    // Sole-shareholder full-price redemption only applies when the user
+    // specifies the share amount directly (fixed-shares input). In the
+    // fixed-assets path the user specifies the asset payout, so the
+    // existing discounted formula determines how many shares are burned —
+    // changing that side asymmetrically would let the user receive more
+    // than they asked for.
+    bool const soleAndFixed =
+        useFix && amount.asset() == share && isSoleShareholder(view(), account_, sleIssuance);
+    WaiveUnrealizedLoss const waive =
+        soleAndFixed ? WaiveUnrealizedLoss::Yes : WaiveUnrealizedLoss::No;
+
     try
     {
         if (amount.asset() == vaultAsset)
@@ -198,7 +220,8 @@ VaultWithdraw::doApply()
         {
             // Fixed shares, variable assets.
             sharesRedeemed = amount;
-            auto const maybeAssets = sharesToAssetsWithdraw(vault, sleIssuance, sharesRedeemed);
+            auto const maybeAssets =
+                sharesToAssetsWithdraw(vault, sleIssuance, sharesRedeemed, waive);
             if (!maybeAssets)
                 return tecINTERNAL;  // LCOV_EXCL_LINE
             assetsWithdrawn = *maybeAssets;
@@ -231,10 +254,40 @@ VaultWithdraw::doApply()
 
     auto assetsAvailable = vault->at(sfAssetsAvailable);
     auto assetsTotal = vault->at(sfAssetsTotal);
-    [[maybe_unused]] auto const lossUnrealized = vault->at(sfLossUnrealized);
+    auto const lossUnrealized = vault->at(sfLossUnrealized);
     XRPL_ASSERT(
         lossUnrealized <= (assetsTotal - assetsAvailable),
         "xrpl::VaultWithdraw::doApply : loss and assets do balance");
+
+    // Post-fixCleanup3_2_0 "final withdrawal" rule: a transaction that
+    // would burn every outstanding share is only permitted when the vault
+    // is in a clean state — no outstanding receivables and no unrealized
+    // loss. Otherwise the resulting (shares == 0, assetsTotal > 0) state
+    // would violate the zero-sized-vault invariant.
+    //
+    // When the rule applies, the payout is forced to exactly
+    // sfAssetsAvailable; in a clean vault the helper result should already
+    // equal that value, and any mismatch is a rounding artifact worth
+    // logging.
+    if (useFix && sharesRedeemed == STAmount{share, sleIssuance->at(sfOutstandingAmount)})
+    {
+        if (*assetsTotal != *assetsAvailable || *lossUnrealized != beast::kZERO)
+        {
+            JLOG(j_.debug()) << "VaultWithdraw: cannot burn all outstanding shares while "
+                                "vault holds outstanding receivables or unrealized loss";
+            return tecLIMIT_EXCEEDED;
+        }
+
+        STAmount const allAvailable{vaultAsset, *assetsAvailable};
+        if (assetsWithdrawn != allAvailable)
+        {
+            JLOG(j_.error())  //
+                << "VaultWithdraw: final withdrawal share-value mismatch;"
+                << " computed=" << assetsWithdrawn.getText()
+                << " assetsAvailable=" << allAvailable.getText();
+        }
+        assetsWithdrawn = allAvailable;
+    }
 
     // The vault must have enough assets on hand. The vault may hold assets
     // that it has already pledged. That is why we look at AssetAvailable

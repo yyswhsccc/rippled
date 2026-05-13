@@ -1,5 +1,6 @@
 #pragma once
 
+#include <xrpl/protocol/AccountID.h>
 #include <xrpl/protocol/STAmount.h>
 #include <xrpl/protocol/STLedgerEntry.h>
 
@@ -7,6 +8,8 @@
 #include <optional>
 
 namespace xrpl {
+
+class ReadView;
 
 /** From the perspective of a vault, return the number of shares to give
     depositor when they offer a fixed amount of assets. Note, since shares are
@@ -62,6 +65,15 @@ assetsToSharesWithdraw(
     STAmount const& assets,
     TruncateShares truncate = TruncateShares::No);
 
+/** Controls whether sharesToAssetsWithdraw subtracts sfLossUnrealized from
+    sfAssetsTotal before computing the exchange rate. The default (No)
+    applies the standard discounted rate; Yes is used when the redeemer is
+    the sole remaining shareholder, in which case the discount serves no
+    front-running protective purpose (there is no counterparty to
+    front-run) and would otherwise prevent them from exiting the vault.
+*/
+enum class WaiveUnrealizedLoss : bool { No = false, Yes = true };
+
 /** From the perspective of a vault, return the number of assets to give the
     depositor when they redeem a fixed amount of shares. Note, since shares are
     MPT, they are always an integral number.
@@ -69,6 +81,8 @@ assetsToSharesWithdraw(
     @param vault The vault SLE.
     @param issuance The MPTokenIssuance SLE for the vault's shares.
     @param shares The amount of shares to convert.
+    @param waive Whether to waive (i.e. not subtract) the vault's unrealized
+                 loss when computing the exchange rate.
 
     @return The number of assets, or nullopt on error.
 */
@@ -76,6 +90,22 @@ assetsToSharesWithdraw(
 sharesToAssetsWithdraw(
     std::shared_ptr<SLE const> const& vault,
     std::shared_ptr<SLE const> const& issuance,
-    STAmount const& shares);
+    STAmount const& shares,
+    WaiveUnrealizedLoss waive = WaiveUnrealizedLoss::No);
+
+/** Returns true iff `account` holds all of the vault's outstanding shares —
+    i.e. is the sole remaining shareholder. Returns false if the account
+    holds no shares or fewer than the total outstanding.
+
+    @param view The ledger view.
+    @param account The candidate sole shareholder.
+    @param issuance The MPTokenIssuance SLE for the vault's shares; provides
+                    both the share MPTID and the outstanding-amount total.
+*/
+[[nodiscard]] bool
+isSoleShareholder(
+    ReadView const& view,
+    AccountID const& account,
+    std::shared_ptr<SLE const> const& issuance);
 
 }  // namespace xrpl

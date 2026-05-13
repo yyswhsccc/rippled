@@ -7175,6 +7175,237 @@ protected:
         BEAST_EXPECT(afterSecondCoverAvailable == 0);
     }
 
+    // Reproduces the "stuck sole shareholder" scenario from the XLS-0065
+    // design doc: a Single Asset Vault holds an impaired loan and the last
+    // remaining shareholder cannot redeem their shares without violating the
+    // zero-sized-vault invariant.
+    //
+    // Setup mirrors the design example:
+    //   - Lender and Bob each deposit 5,000 USD (50/50 split, 50,000 shares
+    //     each at the chosen scale).
+    //   - Lender originates a 3,333 USD loan and impairs it, so
+    //     LossUnrealized = 3,333.
+    //   - Bob withdraws all his shares at the discounted rate, receiving
+    //     ~3,333.50 USD. This succeeds.
+    //   - Lender (sole remaining shareholder) attempts to withdraw all
+    //     remaining shares. Pre-fix this fails because the residual
+    //     unrealized loss would leave 3,333 in assetsTotal with zero shares,
+    //     violating the zero-sized-vault invariant.
+    //   - Post-fix the sole shareholder uses the full-price exchange rate,
+    //     receives all 3,333.50 of assetsAvailable, and retains residual
+    //     shares representing their claim on the deployed (impaired) capital.
+    //
+    // The behavior change is gated on fixCleanup3_2_0. Running with the
+    // amendment disabled exercises the pre-fix bug (tecINVARIANT_FAILED on
+    // the sole-shareholder full redemption); running with the amendment
+    // enabled exercises the new full-price path.
+    void
+    testWithdrawSoleShareholderStuckOnImpairment(FeatureBitset features)
+    {
+        using namespace jtx;
+        using namespace loan;
+        using namespace std::chrono_literals;
+
+        bool const withFix = features[fixCleanup3_2_0];
+        testcase(
+            std::string{"Vault withdraw: sole shareholder can exit despite "
+                        "impaired-loan unrealized loss"} +
+            (withFix ? " (fixCleanup3_2_0)" : " (pre-fix)"));
+
+        // 5,000 USD per depositor, no broker initial deposit, no cover, no
+        // management fee — match the design example as closely as possible.
+        static constexpr std::int64_t kINITIAL_FUNDING = 1'000'000;
+        static constexpr std::int64_t kBORROWER_INITIAL_IOU = 100'000;
+        static constexpr std::int64_t kDEPOSITOR_INITIAL_IOU = 1'000'000;
+        static constexpr std::int64_t kDEPOSIT_AMOUNT = 5'000;
+        static constexpr std::int64_t kPRINCIPAL_AMOUNT = 3'333;
+        static constexpr std::uint32_t kLOCAL_PAYMENT_INTERVAL = 600;
+        static constexpr std::uint32_t kLOCAL_PAYMENT_TOTAL = 2;
+
+        Env env(*this, features);
+
+        Account const issuer{"issuer"};
+        Account const lender{"lender"};
+        Account const bob{"bob"};
+        Account const borrower{"borrowerA"};
+
+        env.fund(XRP(kINITIAL_FUNDING), issuer, lender, bob, borrower);
+        env.close();
+
+        PrettyAsset const iouAsset = issuer[iouCurrency_];
+        env(trust(lender, iouAsset(10'000'000)));
+        env(trust(bob, iouAsset(10'000'000)));
+        env(trust(borrower, iouAsset(10'000'000)));
+        env.close();
+
+        env(pay(issuer, lender, iouAsset(kDEPOSITOR_INITIAL_IOU)));
+        env(pay(issuer, bob, iouAsset(kDEPOSITOR_INITIAL_IOU)));
+        env(pay(issuer, borrower, iouAsset(kBORROWER_INITIAL_IOU)));
+        env.close();
+
+        // Broker with no initial vault deposit, no cover deposit, no
+        // management fee. The two depositors will be the only shareholders.
+        BrokerParameters const params{
+            .vaultDeposit = 0,
+            .debtMax = kPRINCIPAL_AMOUNT * 10,
+            .coverRateMin = TenthBips32{0},
+            .coverDeposit = 0,
+            .managementFeeRate = TenthBips16{0},
+            .coverRateLiquidation = TenthBips32{0}};
+
+        auto const broker = createVaultAndBroker(env, iouAsset, lender, params);
+        Vault v{env};
+
+        env(v.deposit({
+                .depositor = lender,
+                .id = broker.vaultKeylet().key,
+                .amount = iouAsset(kDEPOSIT_AMOUNT),
+            }),
+            Ter(tesSUCCESS));
+        env(v.deposit({
+                .depositor = bob,
+                .id = broker.vaultKeylet().key,
+                .amount = iouAsset(kDEPOSIT_AMOUNT),
+            }),
+            Ter(tesSUCCESS));
+        env.close();
+
+        // Originate the loan from `lender` to `borrower` via the broker.
+        auto const sleBroker = env.le(keylet::loanbroker(broker.brokerID));
+        if (!BEAST_EXPECT(sleBroker))
+            return;
+        auto const loanKeylet = keylet::loan(broker.brokerID, sleBroker->at(sfLoanSequence));
+
+        env(set(borrower, broker.brokerID, kPRINCIPAL_AMOUNT),
+            Sig(sfCounterpartySignature, lender),
+            kPAYMENT_TOTAL(kLOCAL_PAYMENT_TOTAL),
+            kPAYMENT_INTERVAL(kLOCAL_PAYMENT_INTERVAL),
+            Fee(env.current()->fees().base * 2),
+            Ter(tesSUCCESS));
+        env.close();
+
+        // Impair the loan; LossUnrealized should equal the outstanding
+        // principal value (no management fee in this configuration).
+        env(manage(lender, loanKeylet.key, tfLoanImpair), Ter(tesSUCCESS));
+        env.close();
+
+        auto const vaultAfterImpair = env.le(broker.vaultKeylet());
+        if (!BEAST_EXPECT(vaultAfterImpair))
+            return;
+        BEAST_EXPECT(
+            vaultAfterImpair->at(sfLossUnrealized) == broker.asset(kPRINCIPAL_AMOUNT).value());
+
+        // Vault state after impairment:
+        //   AssetsTotal     ≈ 10,000  (10,000 cash before loan; 6,667 cash
+        //                              + 3,333 receivable after loan)
+        //   AssetsAvailable ≈  6,667
+        //   LossUnrealized  =  3,333
+        //   OutstandingShares = 10,000,000,000 (5e9 + 5e9)
+        auto const shareAsset = vaultAfterImpair->at(sfShareMPTID);
+        auto const sleIssuance = env.le(keylet::mptIssuance(shareAsset));
+        if (!BEAST_EXPECT(sleIssuance))
+            return;
+        std::uint64_t const totalSharesBefore = sleIssuance->getFieldU64(sfOutstandingAmount);
+
+        auto const getShareBalance = [&](Account const& a) -> std::uint64_t {
+            auto const t = env.le(keylet::mptoken(shareAsset, a.id()));
+            return t ? t->getFieldU64(sfMPTAmount) : 0;
+        };
+
+        auto const sharesBob = getShareBalance(bob);
+        auto const sharesLender = getShareBalance(lender);
+        BEAST_EXPECT(sharesBob > 0);
+        BEAST_EXPECT(sharesLender == sharesBob);
+        BEAST_EXPECT(sharesBob + sharesLender == totalSharesBefore);
+
+        auto const withdrawAllShares =
+            [&](Account const& depositor, std::uint64_t shares, TER expected) {
+                STAmount const shareAmt{MPTIssue{shareAsset}, Number(shares)};
+                env(v.withdraw({
+                        .depositor = depositor,
+                        .id = broker.vaultKeylet().key,
+                        .amount = shareAmt,
+                    }),
+                    Ter(expected));
+                env.close();
+            };
+
+        // Bob (non-sole) redeems all his shares at the discounted rate.
+        // This should always succeed: the vault still has Lender's shares.
+        withdrawAllShares(bob, sharesBob, tesSUCCESS);
+
+        BEAST_EXPECT(getShareBalance(bob) == 0);
+        BEAST_EXPECT(getShareBalance(lender) == sharesLender);
+
+        // Sanity-check intermediate vault state after Bob's exit. The vault
+        // should be in the "design example" state where:
+        //   AssetsAvailable ≈ 3,333.50, LossUnrealized = 3,333,
+        //   AssetsTotal     ≈ 6,666.50, OutstandingShares = sharesLender.
+        auto const vaultAfterBob = env.le(broker.vaultKeylet());
+        if (!BEAST_EXPECT(vaultAfterBob))
+            return;
+        BEAST_EXPECT(vaultAfterBob->at(sfLossUnrealized) > beast::kZERO);
+        BEAST_EXPECT(vaultAfterBob->at(sfAssetsAvailable) < vaultAfterBob->at(sfAssetsTotal));
+
+        Number const assetsAvailableBeforeFinal = vaultAfterBob->at(sfAssetsAvailable);
+        Number const assetsTotalBeforeFinal = vaultAfterBob->at(sfAssetsTotal);
+
+        // Lender is now the sole shareholder.
+        //
+        // Pre-fix path (fixCleanup3_2_0 disabled): the discounted formula
+        // produces assetsWithdrawn equal to the full assetsAvailable, but
+        // burning all shares leaves residual assetsTotal (the impaired
+        // loan receivable) outstanding — violating the zero-sized-vault
+        // invariant, so the transaction is rejected with tecINVARIANT_FAILED.
+        //
+        // Post-fix path (fixCleanup3_2_0 enabled): the full-price exchange
+        // rate is applied because the redeemer is the sole shareholder; the
+        // depositor receives all of assetsAvailable and retains residual
+        // shares proportional to the deployed (impaired) capital.
+        withdrawAllShares(
+            lender, sharesLender, withFix ? TER{tesSUCCESS} : TER{tecINVARIANT_FAILED});
+
+        auto const sleVaultFinal = env.le(broker.vaultKeylet());
+        if (!BEAST_EXPECT(sleVaultFinal))
+            return;
+        auto const sleIssuanceFinal = env.le(keylet::mptIssuance(shareAsset));
+        if (!BEAST_EXPECT(sleIssuanceFinal))
+            return;
+
+        std::uint64_t const totalSharesFinal = sleIssuanceFinal->getFieldU64(sfOutstandingAmount);
+        Number const assetsTotalFinal = sleVaultFinal->at(sfAssetsTotal);
+        Number const assetsAvailableFinal = sleVaultFinal->at(sfAssetsAvailable);
+        Number const lossUnrealizedFinal = sleVaultFinal->at(sfLossUnrealized);
+
+        if (!withFix)
+        {
+            // Pre-fix: rejected transaction → vault state unchanged from
+            // "after Bob exited" snapshot.
+            BEAST_EXPECT(totalSharesFinal == sharesLender);
+            BEAST_EXPECT(assetsTotalFinal == assetsTotalBeforeFinal);
+            BEAST_EXPECT(assetsAvailableFinal == assetsAvailableBeforeFinal);
+            return;
+        }
+
+        // Post-fix invariants. Vault must not be empty: residual shares +
+        // residual total assets (the impaired-loan receivable) remain to
+        // satisfy the zero-sized-vault invariant.
+        BEAST_EXPECT(totalSharesFinal > 0);
+        BEAST_EXPECT(totalSharesFinal < sharesLender);
+        BEAST_EXPECT(assetsAvailableFinal == beast::kZERO);
+        BEAST_EXPECT(assetsTotalFinal > beast::kZERO);
+
+        // LossUnrealized is unchanged by the withdrawal (the impaired loan
+        // is still on the books); the loan-protocol side is untouched.
+        BEAST_EXPECT(lossUnrealizedFinal == broker.asset(kPRINCIPAL_AMOUNT).value());
+        BEAST_EXPECT(lossUnrealizedFinal == assetsTotalFinal - assetsAvailableFinal);
+
+        // Conservation: assets removed from the vault during this final
+        // withdrawal equal exactly the AssetsAvailable that existed just
+        // before the call.
+        BEAST_EXPECT(assetsTotalBeforeFinal - assetsTotalFinal == assetsAvailableBeforeFinal);
+    }
+
     // Tests that vault withdrawals work correctly when the vault has unrealized
     // loss from an impaired loan, ensuring the invariant check properly
     // accounts for the loss.
@@ -7500,6 +7731,8 @@ public:
         testFullLifecycleVaultPnLNearZeroRate();
 
         testWithdrawReflectsUnrealizedLoss();
+        testWithdrawSoleShareholderStuckOnImpairment(all_);
+        testWithdrawSoleShareholderStuckOnImpairment(all_ | fixCleanup3_2_0);
         testInvalidLoanSet();
 
         auto const all = jtx::testableAmendments();
