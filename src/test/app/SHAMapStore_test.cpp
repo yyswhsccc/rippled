@@ -518,8 +518,23 @@ public:
         Env env(*this, envconfig(onlineDelete));
 
         /////////////////////////////////////////////////////////////
-        // Create NodeStore with two backends to allow online deletion of data.
-        // Normally, SHAMapStoreImp handles all these details.
+        // Create the backend. Normally, SHAMapStoreImp handles all these
+        // details
+        auto nscfg = env.app().config().section(ConfigSection::nodeDatabase());
+
+        // Provide default values:
+        if (!nscfg.exists("cache_size"))
+            nscfg.set(
+                "cache_size",
+                std::to_string(
+                    env.app().config().getValueFor(SizedItem::TreeCacheSize, std::nullopt)));
+
+        if (!nscfg.exists("cache_age"))
+            nscfg.set(
+                "cache_age",
+                std::to_string(
+                    env.app().config().getValueFor(SizedItem::TreeCacheAge, std::nullopt)));
+
         NodeStoreScheduler scheduler(env.app().getJobQueue());
 
         std::string const writableDb = "write";
@@ -527,8 +542,9 @@ public:
         auto writableBackend = makeBackendRotating(env, scheduler, writableDb);
         auto archiveBackend = makeBackendRotating(env, scheduler, archiveDb);
 
+        // Create NodeStore with two backends to allow online deletion of
+        // data
         constexpr int kREAD_THREADS = 4;
-        auto nscfg = env.app().config().section(ConfigSection::nodeDatabase());
         auto dbr = std::make_unique<NodeStore::DatabaseRotatingImp>(
             scheduler,
             kREAD_THREADS,
